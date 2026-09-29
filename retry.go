@@ -27,6 +27,15 @@ type retryOptions struct {
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	Budget         *Budget       // Optional shared remaining-time budget.
+	Limits         []retryLimit  // Per-error-class attempt limits.
+}
+
+// retryLimit caps the number of attempts whose error matches a class.
+type retryLimit struct {
+	match    func(error) bool
+	maxTries uint
+	tries    uint
 }
 
 // RetryOption configures the behavior of Retry.
@@ -91,6 +100,72 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 	}
 }
 
+// WithBudget bounds retrying by a remaining-time budget shared across Retry
+// calls — typically one per logical request, created at its entry point and
+// handed down through nested layers. Before scheduling another attempt, Retry
+// checks the budget's remaining time (which already reflects everything spent
+// so far, by any layer); when it cannot cover the next backoff window, Retry
+// stops immediately instead of waiting, and returns a *RetryError with Cause
+// ErrMaxElapsedTime and LastErr preserved.
+//
+// Unlike WithMaxElapsedTime, which measures from the moment each Retry call
+// starts, a Budget measures from when the request started, so nested Retry
+// loops cannot collectively overrun it. The two compose: the first limit
+// reached stops the loop, and both report ErrMaxElapsedTime.
+//
+// Like WithMaxElapsedTime, the budget is checked only between attempts: it
+// gates whether another attempt is scheduled and never interrupts a running
+// operation or a wait already in progress. Use a context deadline for that.
+func WithBudget(b *Budget) RetryOption {
+	return func(args *retryOptions) {
+		args.Budget = b
+	}
+}
+
+// WithMaxTriesFor limits the total number of attempts whose error matches
+// match, counted independently from WithMaxTries and from other classes.
+// Like WithMaxTries, it counts attempts, not retries: WithMaxTriesFor(m, 1)
+// stops on the first matching error without retrying it. When the limit is
+// reached, Retry returns a *RetryError with Cause ErrExhausted and LastErr
+// set to the matching error. A maxTries of 0 means no limit for that class.
+//
+// The option may be supplied multiple times to give different error classes
+// different limits; an error can match several classes and counts against
+// each of them. match receives the error exactly as the operation returned
+// it, so use errors.Is or errors.As inside it to see through wrapping:
+//
+//	backoff.Retry(ctx, op,
+//		backoff.WithMaxTriesFor(func(err error) bool {
+//			return errors.Is(err, syscall.ECONNRESET)
+//		}, 5),
+//		backoff.WithMaxTriesFor(func(err error) bool {
+//			return errors.Is(err, errRateLimited)
+//		}, 2),
+//	)
+//
+// Errors matched by no class are unlimited (beyond WithMaxTries and the
+// other limits). A permanent error still stops Retry immediately, before any
+// class limit is consulted.
+func WithMaxTriesFor(match func(error) bool, maxTries uint) RetryOption {
+	return func(args *retryOptions) {
+		args.Limits = append(args.Limits, retryLimit{match: match, maxTries: maxTries})
+	}
+}
+
+// WithRandomizationFactor sets the jitter ratio of the backoff policy Retry
+// uses: each wait is randomized within ±f of its interval, so f == 0 disables
+// jitter. It applies to the policy configured at the point the option is
+// applied — the default NewExponentialBackOff, or one supplied earlier with
+// WithBackOff — and only when that policy is an *ExponentialBackOff; other
+// policies are left untouched.
+func WithRandomizationFactor(f float64) RetryOption {
+	return func(args *retryOptions) {
+		if exp, ok := args.BackOff.(*ExponentialBackOff); ok {
+			exp.RandomizationFactor = f
+		}
+	}
+}
+
 // Retry attempts the operation until it succeeds, returns a Permanent error,
 // or backoff completes. It ensures the operation is executed at least once.
 //
@@ -145,6 +220,21 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			lastErr = retryAfter.err
 		}
 
+		// Stop retrying if a per-error-class attempt limit is reached.
+		exhausted := false
+		for i := range args.Limits {
+			l := &args.Limits[i]
+			if l.match != nil && l.match(err) {
+				l.tries++
+				if l.maxTries > 0 && l.tries >= l.maxTries {
+					exhausted = true
+				}
+			}
+		}
+		if exhausted {
+			return res, &RetryError{LastErr: lastErr, Cause: ErrExhausted}
+		}
+
 		// Stop retrying if maximum tries exceeded.
 		if args.MaxTries > 0 && numTries >= args.MaxTries {
 			return res, &RetryError{LastErr: lastErr, Cause: ErrExhausted}
@@ -170,6 +260,13 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		// Stop retrying if maximum elapsed time exceeded.
 		if args.MaxElapsedTime > 0 && time.Since(startedAt)+next > args.MaxElapsedTime {
 			return res, &RetryError{LastErr: lastErr, Cause: ErrMaxElapsedTime}
+		}
+
+		// Stop retrying if the shared budget cannot cover the next wait.
+		if args.Budget != nil {
+			if remaining := args.Budget.Remaining(); remaining <= 0 || remaining < next {
+				return res, &RetryError{LastErr: lastErr, Cause: ErrMaxElapsedTime}
+			}
 		}
 
 		// Notify on error if a notifier function is provided.

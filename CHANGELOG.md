@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Budget` and `WithBudget`: a remaining-time budget shared across nested `Retry` calls. When the remaining time cannot cover the next backoff window, `Retry` stops immediately with a `*RetryError` whose `Cause` is `ErrMaxElapsedTime` instead of waiting out the window.
+- `WithMaxTriesFor`: per-error-class attempt limits, reported as `ErrExhausted` when reached.
+- `WithRandomizationFactor`: configures the jitter ratio of the exponential backoff policy used by `Retry`.
+
 ## [7.0.0] - 2026-06-30
 
 ### Changed

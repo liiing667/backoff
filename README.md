@@ -42,7 +42,7 @@ result, err := backoff.Retry(ctx, func() (string, error) {
 backoff until it succeeds, returns a `Permanent` error, or a limit is reached.
 See [example_test.go][example] for a fuller example, and the [package docs][godoc]
 for the available options (`WithBackOff`, `WithMaxTries`, `WithMaxElapsedTime`,
-`WithNotify`).
+`WithBudget`, `WithMaxTriesFor`, `WithRandomizationFactor`, `WithNotify`).
 
 If `Retry` does not fit your needs, copy it from [retry.go][retry-src] and adapt it.
 
@@ -77,6 +77,7 @@ Two independent limits cap how long `Retry` runs, and they behave differently:
 
 - A **context deadline** (`context.WithTimeout`) is reactive: it interrupts the wait between attempts and — if your operation observes the context — can abort an in-flight attempt. `Retry` reports it as `context.DeadlineExceeded`.
 - **`WithMaxElapsedTime`** bounds only retry scheduling: it is checked between attempts, never interrupts a running operation, and is reported as `ErrMaxElapsedTime`.
+- **`WithBudget`** shares one remaining-time budget across nested `Retry` calls (e.g. the layers of a single request): create it once with `backoff.NewBudget(d)` and pass it to every layer. Each layer deducts spent time from the same budget, and once the remainder cannot cover the next backoff window, `Retry` stops immediately — also reported as `ErrMaxElapsedTime`.
 
 `WithMaxElapsedTime` defaults to 15 minutes, so **both limits are active unless you override it** — pass `backoff.WithMaxElapsedTime(0)` to rely solely on the context.
 
