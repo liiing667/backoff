@@ -22,11 +22,15 @@ type Notify func(error, time.Duration)
 
 // retryOptions holds configuration settings for the retry mechanism.
 type retryOptions struct {
-	BackOff        BackOff       // Strategy for calculating backoff periods.
-	Timer          timer         // Timer to manage retry delays.
-	Notify         Notify        // Optional function called before each backoff wait.
-	MaxTries       uint          // Maximum number of retry attempts.
-	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	BackOff             BackOff         // Strategy for calculating backoff periods.
+	Timer               timer           // Timer to manage retry delays.
+	Notify              Notify          // Optional function called before each backoff wait.
+	MaxTries            uint            // Maximum number of retry attempts.
+	MaxElapsedTime      time.Duration   // Maximum total time for all retries.
+	Budget              *TimeBudget     // Optional budget shared across nested Retry calls.
+	Classify            ErrorClassifier // Optional per-error-class retry allowances.
+	RandomizationFactor float64         // Optional jitter for the default backoff; <0 means unset.
+	defaultBackOff      bool            // Whether BackOff is the default exponential policy.
 }
 
 // RetryOption configures the behavior of Retry.
@@ -41,6 +45,7 @@ type RetryOption func(*retryOptions)
 func WithBackOff(b BackOff) RetryOption {
 	return func(args *retryOptions) {
 		args.BackOff = b
+		args.defaultBackOff = false
 	}
 }
 
@@ -91,6 +96,80 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 	}
 }
 
+// WithTimeBudget attaches a TimeBudget shared across Retry calls that belong
+// to the same request. Before each retry, Retry charges the time already spent
+// (the failed attempt plus any wait already endured) against the budget, and
+// when the remaining budget cannot cover the next backoff wait it stops
+// immediately — without sleeping — returning a *RetryError with Cause
+// ErrMaxElapsedTime and LastErr set to the last operation error.
+//
+// This complements WithMaxElapsedTime: WithMaxElapsedTime bounds a single
+// Retry call measured from its own start, whereas a shared TimeBudget spans
+// nested or sequential calls, so time burned by lower layers leaves less
+// budget for the layers above.
+//
+// The budget is checked only between attempts, like WithMaxElapsedTime; it
+// never interrupts a running operation or a wait in progress. Passing nil
+// disables the budget (the default).
+func WithTimeBudget(b *TimeBudget) RetryOption {
+	return func(args *retryOptions) {
+		args.Budget = b
+	}
+}
+
+// ErrorClassifier maps an operation error to a retry class and the maximum
+// number of retries allowed for errors of that class. It is invoked with the
+// error returned by each failed attempt. Return ok=false for errors the
+// classifier does not cover; they are retried without a class-specific limit
+// (but WithMaxTries, the budget, and the context still apply).
+//
+// Allowances are counted as retries, not total attempts, independently per
+// class: WithMaxTries counts every attempt, while a class allowance counts
+// only retries made for that class. When an allowance is exhausted, Retry
+// returns a *RetryError with Cause ErrExhausted and LastErr set to the last
+// operation error.
+//
+// For example, with gRPC status codes, one might allow more retries for
+// codes.Unavailable than for codes.ResourceExhausted:
+//
+//	classify := func(err error) (string, uint, bool) {
+//		st, ok := status.FromError(err)
+//		if !ok {
+//			return "", 0, false
+//		}
+//		switch st.Code() {
+//		case codes.Unavailable:
+//			return "unavailable", 5, true
+//		case codes.ResourceExhausted:
+//			return "rate_limited", 2, true
+//		default:
+//			return "", 0, false
+//		}
+//	}
+type ErrorClassifier func(err error) (class string, maxRetries uint, ok bool)
+
+// WithErrorClassifier limits how many times each error class may be retried,
+// counted independently per class; see ErrorClassifier.
+func WithErrorClassifier(c ErrorClassifier) RetryOption {
+	return func(args *retryOptions) {
+		args.Classify = c
+	}
+}
+
+// WithRandomizationFactor sets the jitter ratio of the default exponential
+// backoff policy: NextBackOff ranges within 1±factor of the current interval,
+// so 0 disables jitter entirely and 0.5 (the default) allows ±50%. Values
+// outside [0, 1] are clamped to that range.
+//
+// It applies only to the default ExponentialBackOff: combining it with
+// WithBackOff gives the supplied policy priority, so configure a custom
+// policy's jitter directly instead.
+func WithRandomizationFactor(factor float64) RetryOption {
+	return func(args *retryOptions) {
+		args.RandomizationFactor = factor
+	}
+}
+
 // Retry attempts the operation until it succeeds, returns a Permanent error,
 // or backoff completes. It ensures the operation is executed at least once.
 //
@@ -108,9 +187,11 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOption) (T, error) {
 	// Initialize default retry options.
 	args := &retryOptions{
-		BackOff:        NewExponentialBackOff(),
-		Timer:          &defaultTimer{},
-		MaxElapsedTime: DefaultMaxElapsedTime,
+		BackOff:             NewExponentialBackOff(),
+		Timer:               &defaultTimer{},
+		MaxElapsedTime:      DefaultMaxElapsedTime,
+		RandomizationFactor: -1,
+		defaultBackOff:      true,
 	}
 
 	// Apply user-provided options to the default settings.
@@ -118,9 +199,18 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		opt(args)
 	}
 
+	// Apply the jitter override to the default exponential policy.
+	if args.defaultBackOff && args.RandomizationFactor >= 0 {
+		if exp, ok := args.BackOff.(*ExponentialBackOff); ok {
+			exp.RandomizationFactor = min(max(args.RandomizationFactor, 0), 1)
+		}
+	}
+
 	defer args.Timer.Stop()
 
 	startedAt := time.Now()
+	var charged time.Duration
+	var classRetries map[string]uint
 	args.BackOff.Reset()
 	for numTries := uint(1); ; numTries++ {
 		// Execute the operation.
@@ -145,9 +235,29 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			lastErr = retryAfter.err
 		}
 
+		// Charge the time spent since the last charge against the shared budget.
+		if args.Budget != nil {
+			spent := time.Since(startedAt) - charged
+			args.Budget.spend(spent)
+			charged += spent
+		}
+
 		// Stop retrying if maximum tries exceeded.
 		if args.MaxTries > 0 && numTries >= args.MaxTries {
 			return res, &RetryError{LastErr: lastErr, Cause: ErrExhausted}
+		}
+
+		// Stop retrying if this error's class used up its retry allowance.
+		if args.Classify != nil {
+			if class, maxRetries, ok := args.Classify(err); ok {
+				if classRetries == nil {
+					classRetries = make(map[string]uint)
+				}
+				if classRetries[class] >= maxRetries {
+					return res, &RetryError{LastErr: lastErr, Cause: ErrExhausted}
+				}
+				classRetries[class]++
+			}
 		}
 
 		// Stop retrying if context is cancelled.
@@ -170,6 +280,16 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		// Stop retrying if maximum elapsed time exceeded.
 		if args.MaxElapsedTime > 0 && time.Since(startedAt)+next > args.MaxElapsedTime {
 			return res, &RetryError{LastErr: lastErr, Cause: ErrMaxElapsedTime}
+		}
+
+		// Stop retrying if the shared budget cannot cover the next wait, and
+		// charge the wait up front so nested Retry calls see it as spent.
+		if args.Budget != nil {
+			if args.Budget.Remaining() < next {
+				return res, &RetryError{LastErr: lastErr, Cause: ErrMaxElapsedTime}
+			}
+			args.Budget.spend(next)
+			charged += next
 		}
 
 		// Notify on error if a notifier function is provided.

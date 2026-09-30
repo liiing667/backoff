@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `TimeBudget` and `WithTimeBudget`: a wall-clock budget shared across nested or sequential `Retry` calls. Retry charges elapsed attempt and wait time against it before each retry and stops with `ErrMaxElapsedTime` instead of sleeping when the remaining budget cannot cover the next backoff wait.
+- `ErrorClassifier` and `WithErrorClassifier`: per-error-class retry allowances, counted independently per class. Exhausting an allowance reports `ErrExhausted` like `WithMaxTries`.
+- `WithRandomizationFactor`: configures the jitter ratio of the default exponential backoff policy.
+
 ## [7.0.0] - 2026-06-30
 
 ### Changed

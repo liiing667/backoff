@@ -42,6 +42,7 @@ result, err := backoff.Retry(ctx, func() (string, error) {
 backoff until it succeeds, returns a `Permanent` error, or a limit is reached.
 See [example_test.go][example] for a fuller example, and the [package docs][godoc]
 for the available options (`WithBackOff`, `WithMaxTries`, `WithMaxElapsedTime`,
+`WithTimeBudget`, `WithErrorClassifier`, `WithRandomizationFactor`,
 `WithNotify`).
 
 If `Retry` does not fit your needs, copy it from [retry.go][retry-src] and adapt it.
@@ -79,6 +80,25 @@ Two independent limits cap how long `Retry` runs, and they behave differently:
 - **`WithMaxElapsedTime`** bounds only retry scheduling: it is checked between attempts, never interrupts a running operation, and is reported as `ErrMaxElapsedTime`.
 
 `WithMaxElapsedTime` defaults to 15 minutes, so **both limits are active unless you override it** — pass `backoff.WithMaxElapsedTime(0)` to rely solely on the context.
+
+### Sharing a budget across nested calls
+
+When several layers of one request each wrap their work in `Retry` (e.g. handler → service → gRPC client), `WithMaxElapsedTime` alone gives every layer its own clock: a lower layer can eat the whole request deadline while upper layers keep waiting for backoff windows that are already too late.
+
+`NewTimeBudget` creates a single wall-clock budget; pass the same one to every layer with `WithTimeBudget`. Before each retry a layer charges its already-spent attempt and wait time, and if the remainder cannot cover the next wait it stops immediately with `ErrMaxElapsedTime` — no extra sleep:
+
+```go
+budget := backoff.NewTimeBudget(2 * time.Second)
+
+// Both the outer and inner Retry calls receive the same budget.
+result, err := backoff.Retry(ctx, func() (string, error) {
+	return callDownstream(ctx, budget)
+}, backoff.WithTimeBudget(budget))
+```
+
+### Per-error retry limits and jitter
+
+`WithErrorClassifier` maps each operation error to a class with its own retry allowance, counted independently (e.g. retry gRPC `Unavailable` five times but `ResourceExhausted` twice); exhaustion reports `ErrExhausted`. `WithRandomizationFactor(0.25)` sets the default exponential policy's jitter to ±25% — `0` disables it.
 
 ## Contributing
 
